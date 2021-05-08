@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
 	std::cout << "  13 - Convolution on GPU \n";
 	std::cout << "  14 - Matrix Multiply on CPU \n";
 	std::cout << "  15 - Matrix Multiply on GPU \n";
+	std::cout << "  16 - Alexnet on GPU \n";
 
 	std::cin >> choice;
 
@@ -130,6 +131,12 @@ int main(int argc, char** argv) {
 		case 15:
 			std::cout << "Running GemmLayer on GPU! \n\n";
 			runGpuGemm(argc, argv);	
+			std::cout << "\n\n ... Done!\n";
+			break;
+
+		case 16:
+			std::cout << "Running Alexnet on GPU! \n\n";
+			runAlexnet(argc, argv);	
 			std::cout << "\n\n ... Done!\n";
 			break;
 

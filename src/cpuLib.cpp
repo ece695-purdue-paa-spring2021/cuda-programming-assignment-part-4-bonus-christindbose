@@ -387,7 +387,7 @@ int makeTensor (float ** t, TensorShape & shape) {
 		shape.count = 1;
 	}
 
-	uint64_t tensorSize = shape.height * shape.width * shape.channels;
+	uint64_t tensorSize = shape.count * shape.height * shape.width * shape.channels;
 	*t = (float *) malloc (tensorSize * sizeof(float));
 
 	if (*t == nullptr) {

@@ -1,5 +1,9 @@
 
 #include "cudaLib.cuh"
+#include "cpuLib.h"
+#define CONVTILE_SIZE 8
+#define GEMMTILE_WIDTH 8
+#define TILE_SIZE 16
 
 void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
 {
@@ -126,18 +130,180 @@ uint64_t evaluateGpuConv (TensorShape iShape, TensorShape fShape,
 	return errorCount;
 }
 
-int convLayer_gpu ( float * input, TensorShape iShape, 
-	float * filter, TensorShape fShape, 
-	float * bias, float * output, TensorShape & oShape, 
-	ConvLayerArgs & args, uint32_t batchSize) {
 
-	return 0;
+TensorShape convout_shape(TensorShape iShape, TensorShape fShape, ConvLayerArgs args){
+
+    TensorShape oShape;
+	oShape.height 	= (iShape.height + 2 * args.padH - fShape.height) / args.strideH + 1;
+	oShape.width	= (iShape.width  + 2 * args.padW - fShape.width)  / args.strideW + 1;
+	oShape.channels	= (fShape.count);
+	oShape.count 	= iShape.count;				//	Might scale to batch size
+
+	return oShape;
+
 }
+
+TensorShape poolout_shape(TensorShape iShape, PoolLayerArgs poolArgs){
+
+	TensorShape outShape;
+
+    outShape.height = (iShape.height-poolArgs.poolH)/poolArgs.strideH + 1;		// set dimension of output tensor based on pool width/height and stride.
+	outShape.width = (iShape.width-poolArgs.poolW)/poolArgs.strideW + 1;
+
+	outShape.channels=iShape.channels;
+	outShape.count = iShape.count;
+
+	return outShape;
+
+}
+
+TensorShape gemmout_shape(TensorShape aShape, TensorShape bShape){
+
+	TensorShape cShape;
+
+	cShape.height = aShape.height;
+	cShape.width = bShape.width;
+	cShape.channels = aShape.channels;
+	cShape.count = aShape.count;
+
+	return cShape;
+
+}
+
+
+
+void convLayer ( float * input, TensorShape iShape, 
+	float * filter, TensorShape fShape, 
+	float * bias, float * output, TensorShape oShape, 
+	ConvLayerArgs args, uint32_t batchSize){
+
+	dim3 dimBlock(CONVTILE_SIZE, CONVTILE_SIZE,1);
+	dim3 dimGrid((int)ceil((float)oShape.height / (float)CONVTILE_SIZE),
+					(int)ceil((float)oShape.width / (float)CONVTILE_SIZE),
+					oShape.channels * oShape.count );
+		
+	convLayer_gpu<<<dimGrid, dimBlock>>> (input, iShape, filter, fShape, bias, output, oShape, args, 1);		
+	
+	cudaFree(input);
+	cudaFree(bias);
+	cudaFree(filter);
+
+
+	}
+
+
+
+__global__
+void convLayer_gpu ( float * input, TensorShape iShape, 
+	float * filter, TensorShape fShape, 
+	float * bias, float * output, TensorShape oShape, 
+	ConvLayerArgs args, uint32_t batchSize) {
+
+	uint32_t tx=threadIdx.x;
+	uint32_t ty=threadIdx.y;
+
+	// Set row and column for thread.
+	uint32_t outrow = blockIdx.y * blockDim.y + ty;
+	uint32_t outcol = blockIdx.x * blockDim.x + tx;
+	uint32_t outchannel=blockIdx.z % oShape.channels; // This is the FILTER COUNT ALSO
+    uint32_t outcount=blockIdx.z / oShape.channels; //  
+
+	__shared__ float sharedmem [2000]; 
+    float* shared_filter= sharedmem;
+	float* shared_bias= sharedmem + fShape.height * fShape.width;
+    float* shared_input= shared_bias+1;
+
+	if ((ty==0) && (tx==0))
+	*(shared_bias)=bias[outchannel]; 
+
+	float outbias = bias[outchannel]; 
+
+	uint32_t numrow = CONVTILE_SIZE*args.strideH - args.strideH + fShape.height;
+	uint32_t numcol = CONVTILE_SIZE*args.strideW - args.strideW + fShape.width;
+
+	uint32_t startrow = blockIdx.y * blockDim.y * args.strideH - args.padH;
+	uint32_t startcol = blockIdx.x * blockDim.x * args.strideW - args.padW;
+
+	uint32_t offset;
+	float output_psum=0;
+
+	if ( (outrow<oShape.height) && (outcol<oShape.width) ) // valid outputs
+		
+	{ 
+
+     	output_psum = outbias; //shared_bias[0];
+		
+	}
+
+
+	for (uint32_t c=0; c<iShape.channels; c++) {
+
+
+		for (uint32_t i=CONVTILE_SIZE*tx+ty; i<fShape.height * fShape.width; i+=CONVTILE_SIZE*CONVTILE_SIZE){
+				if (i < fShape.height * fShape.width) // Dont need this, right?
+					shared_filter[i] = filter[outchannel*fShape.height*fShape.width*fShape.channels + c*fShape.height*fShape.width+i];
+				}		
+
+		for (uint32_t j=ty; j< numrow; j+=CONVTILE_SIZE)
+			for (uint32_t i=tx; i< numcol; i+=CONVTILE_SIZE)
+		    {            
+				uint32_t getrow = startrow + j;
+				uint32_t getcol = startcol + i;
+				
+
+                if  ( (getrow<iShape.height) && (getcol<iShape.width) ) // Just a sanity check
+				
+				{
+                    if ( (getrow >= 0) || (getcol >= 0) ){
+						//shared_input[j * numcol + i]=0;
+						shared_input[j * numcol + i]=input[IDX2offset(outcount, c, getrow, getcol, iShape.channels, iShape.height, iShape.width)];
+					}				            
+			    }
+			}
+
+		__syncthreads();
+
+		if ( (outrow<oShape.height) && (outcol<oShape.width) ) // valid outputs
+		
+		{ 			
+		    for (uint32_t i = 0; i < fShape.height; ++ i) {
+			   for (uint32_t j = 0; j < fShape.width; ++ j) {					
+		
+				if ( ( outrow * args.strideH - args.padH + i < 0 ) || ( outrow * args.strideH - args.padH + i >= iShape.height ) ||
+					   ( outcol * args.strideW - args.padW + j < 0 ) || ( outcol * args.strideW - args.padW + j >= iShape.width ) ) {
+						   output_psum+=0; // Padded output
+					   }
+					else {
+					  uint32_t row = ty * args.strideH  + i;
+					  uint32_t col = tx * args.strideW  + j; 
+					  //output_psum += ( shared_input[row * numcol + col] * shared_filter[c*fShape.height*fShape.width+fShape.width*i + j] );
+					  output_psum += ( shared_input[row * numcol + col] * shared_filter[fShape.width*i + j] );
+					}							
+				}
+			}
+		}
+		
+		__syncthreads(); // Do i need this?		
+    }
+    
+	if ( (outrow<oShape.height) && (outcol<oShape.width) ) {
+	    offset = IDX2offset(outcount, outchannel, outrow, outcol, oShape.channels, oShape.height, oShape.width);
+	
+	    if (args.activation){
+           output[offset] = output_psum > 0 ? output_psum:0;
+	     }
+	    else
+	       output[offset]=output_psum;
+
+	    }
+}
+
+
 
 
 int runGpuGemm (int argc, char ** argv) {
 
-	evaluateGpuGemm();
+	//evaluateGpuGemm();
 	return 0;
 }
 
@@ -146,5 +312,478 @@ int evaluateGpuGemm () {
 	return 0;
 }
 
-//	STUDENT: Add functions here
+void gemmLayer (float * a, TensorShape aShape, 
+	float * b, TensorShape bShape,
+	float * c, TensorShape cShape,
+	GemmLayerArgs args, uint32_t batchSize)
+{  	dim3 dimBlock(GEMMTILE_WIDTH, GEMMTILE_WIDTH,1);
+	dim3 dimGrid((int)ceil((float)cShape.width / (float)GEMMTILE_WIDTH),
+				(int)ceil((float)cShape.height / (float)GEMMTILE_WIDTH),
+			     1);
+	
+    gemmLayer_gpu <<<dimGrid, dimBlock>>> (a, aShape, b, bShape, c, cShape, args, 1);
+
+	cudaFree(a);
+	cudaFree(b);
+}
+
+
+__global__ void gemmLayer_gpu (float * a, TensorShape aShape, 
+	float * b, TensorShape bShape,
+	float * c, TensorShape cShape,
+	GemmLayerArgs args, uint32_t batchSize)
+{
+
+	__shared__ float ds_a[GEMMTILE_WIDTH][GEMMTILE_WIDTH];
+	__shared__ float ds_b[GEMMTILE_WIDTH][GEMMTILE_WIDTH];
+		  
+	int bx = blockIdx.x;  int by = blockIdx.y;
+	int tx = threadIdx.x; int ty = threadIdx.y;
+		  
+	int Row = by * blockDim.y + ty;
+	int Col = bx * blockDim.x + tx;
+	
+	float Pvalue = 0;
+    int n=cShape.width;
+
+	// Loop over the M and N tiles required to compute the P element
+
+	for (int p = 0; p < n/GEMMTILE_WIDTH; p++) {
+	    // Collaborative loading of M and N tiles into shared memory
+
+	   if ( (Row<aShape.height) && (p*GEMMTILE_WIDTH+tx < aShape.width) )
+	        ds_a[ty][tx] = a[Row*aShape.width + p*GEMMTILE_WIDTH+tx];
+
+
+		if ( ((p*GEMMTILE_WIDTH+ty) < bShape.height) && (Col < bShape.width) )
+	        ds_b[ty][tx] = b[(p*GEMMTILE_WIDTH+ty)*bShape.width + Col];
+	    
+		__syncthreads();
+		  
+	    for (int i = 0; i < GEMMTILE_WIDTH; i++)
+		     Pvalue += ds_a[ty][i] * ds_b[i][tx];
+			 
+		__syncthreads(); 
+	   
+
+	}	
+
+	if ( (Row<cShape.height) && (Col<cShape.width) ){
+		c[Row*cShape.width+Col] = Pvalue;
+	}
+				  
+}
+
+
+int runGpuPool (TensorShape inShape, PoolLayerArgs poolArgs){
+
+
+	std::cout << "Set Tensors to stun !!";
+
+	int Size = inShape.height * inShape.width * inShape.channels;
+
+	std::cout << "Input Size = " << Size << "\n";
+
+    float *input = (float *) malloc(Size * sizeof(float));
+
+	std::cout <<"Initializing input data with natural numbers"<<"\n";
+
+	for (int i=0; i<Size; i++)
+	    *(input+i)=float(i);
+
+    TensorShape outShape;
+
+    outShape.height = (inShape.height-poolArgs.poolH)/poolArgs.strideH + 1;		// set dimension of output tensor based on pool width/height and stride.
+	outShape.width = (inShape.width-poolArgs.poolW)/poolArgs.strideW + 1;
+
+	outShape.channels=inShape.channels;
+	outShape.count = inShape.count;
+
+	int OutSize = outShape.height * outShape.width * outShape.channels;
+
+	std::cout << "Output Size = " << OutSize << "\n";
+
+    float *output = (float *) malloc(OutSize * sizeof(float));
+
+	float* input_d;
+	float* output_d;
+
+	auto tStart = std::chrono::high_resolution_clock::now();
+    
+	cudaMalloc(&input_d, Size * sizeof(float) );
+	cudaMemcpy(input_d, input, Size * sizeof(float), cudaMemcpyHostToDevice);
+
+
+	cudaMalloc(&output_d, OutSize * sizeof(float) );
+
+
+    
+	dim3 dimBlock(TILE_SIZE, TILE_SIZE,1);
+	dim3 dimGrid((int)ceil((float)inShape.height / (float)TILE_SIZE),
+				(int)ceil((float)inShape.width / (float)TILE_SIZE),
+			    outShape.channels);
+
+	poolLayer_gpu<<<dimGrid, dimBlock>>> (input_d, inShape, output_d, outShape, poolArgs);
+
+   
+	cudaMemcpy(output, output_d, OutSize * sizeof(float), cudaMemcpyDeviceToHost);
+
+	cudaFree(input_d);
+	cudaFree(output_d);
+
+	auto tEnd = std::chrono::high_resolution_clock::now();
+
+	std::chrono::duration<double> time_span = (tEnd- tStart);
+	std::cout << "It took " << time_span.count() << " seconds.";
+
+	return 0;
+
+}
+
+
+void poolLayer (float * input, TensorShape inShape,
+	float * output, TensorShape outShape, PoolLayerArgs args){
+
+	dim3 dimBlock(TILE_SIZE, TILE_SIZE,1);
+	dim3 dimGrid((int)ceil((float)inShape.height / (float)TILE_SIZE),
+					(int)ceil((float)inShape.width / (float)TILE_SIZE),
+					outShape.channels);
+	
+
+	poolLayer_gpu<<<dimGrid, dimBlock>>> (input, inShape, output, outShape, args);	
+	cudaFree(input);	
+
+}
+
+__global__
+void poolLayer_gpu (float * input, TensorShape inShape,
+	float * output, TensorShape outShape, PoolLayerArgs args){
+
+		int tx=threadIdx.x;
+		int ty=threadIdx.y;
+	
+		// Set row and colum for thread.
+		uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+		uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+		uint32_t channel=blockIdx.z % outShape.channels; // This is the FILTER COUNT ALSO
+		uint32_t count=blockIdx.z / outShape.channels; // out count
+	
+		__shared__ float sharedmem [TILE_SIZE+7][TILE_SIZE+7]; // Should be a minimum of [TILE_SIZE+FIL-1][TILE_SIZE+FIL-1]
+
+		// bool is_x_left = (tx == 0);
+		bool is_x_right = (tx == TILE_SIZE-1);
+		// bool is_y_top = (ty == 0);
+		bool is_y_bottom = (ty == TILE_SIZE-1);
+
+
+
+		// Initialize edges
+
+		if (is_x_right){
+
+			for (int i=1; i<=args.poolW-1; i++)
+				sharedmem[ty][tx+i] = 0;
+		}
+
+		if (is_y_bottom){
+
+			for (int i=1; i<=args.poolH-1; i++)
+				sharedmem[ty+i][tx] = 0;
+	
+			if (is_x_right){
+	
+				for (int i=1; i<=args.poolW-1; i++)
+					 for (int j=1; j<=args.poolH-1; j++)
+						sharedmem[ty+j][tx+i] = 0;
+	
+			}
+		}
+		
+		// Initialize shared mem with values
+
+		//sharedmem[ty][tx]=input[(row * inShape.width + col) * inShape.channels + channel];IDX2offset(n, c, h, w, cDim, hDim, wDim)
+        sharedmem[ty][tx]=input[IDX2offset(count, channel, row, col, inShape.channels, inShape.height, inShape.width)];
+
+		if(is_x_right) {
+			for (int i=1; (i<=args.poolW-1) && (col+i)<=inShape.width-1; i++)
+			    sharedmem[ty][tx+i] = input[IDX2offset(count, channel, row, col+i, inShape.channels, inShape.height, inShape.width)];
+			    //sharedmem[ty][tx+i] = input[(row * inShape.width + col+i) * inShape.channels + channel];
+		}
+
+		if (is_y_bottom){
+
+			for (int i=1; (i<=args.poolH-1) && (row+i)<=inShape.height-1; i++)
+				sharedmem[ty+i][tx] = input[IDX2offset(count, channel, row+i, col, inShape.channels, inShape.height, inShape.width)];
+				//sharedmem[ty+i][tx] = input[((row+i) * inShape.width + col) * inShape.channels + channel];
+	
+			if (is_x_right){
+	
+				for (int i=1; (i<=args.poolW-1) && (col+i)<=inShape.width-1; i++)
+					 for (int j=1; (j<=args.poolH-1) && (row+j)<=inShape.height-1; j++)
+						sharedmem[ty+j][tx+i] = input[IDX2offset(count, channel, row+j, col+i, inShape.channels, inShape.height, inShape.width)];
+	                    //sharedmem[ty+j][tx+i] = input[((row+j) * inShape.width + col+i) * inShape.channels + channel];
+			}
+		}
+
+		__syncthreads();   //Wait for all threads to be done.
+
+    if ( (col % args.strideW == 0) && (row % args.strideH == 0) && ((col + args.poolW) <= inShape.width) && ((row + args.poolH) <= inShape.height) )  {
+        
+		float max = sharedmem[ty][tx]; // assigning max as current thread
+
+		for (int i = 0; i < args.poolW; i++) { // FIND Max
+			for (int j = 0; j < args.poolH; j++) {
+				if (sharedmem[ty+j][tx+i] > max) { 
+					//Save max value
+					max = sharedmem[ty+j][tx+i];
+				}
+			}
+		}
+	    
+		uint32_t offset = IDX2offset(count, channel, (row/args.strideH), (col/args.strideW), outShape.channels, outShape.height, outShape.width);
+		output[offset] = max;
+		//*(output+( (row/args.strideH) * outShape.width + (col/args.strideW) ) * outShape.channels + channel) = max;  //Set the output variables.  
+
+	}
+
+	}
+
+float * makeTensor_batch (TensorShape shape) {
+	float * t = (float *) malloc (tensorSize(shape) * sizeof(float));
+	if (shape.count == 0) {
+		std::cout << " Shape has invalid count (4th dim) - setting to 1 \n";
+		shape.count = 1;
+	}
+
+	if (t == nullptr) {
+		std::cout << "Malloc failed ! \n";
+		return nullptr;
+	}
+
+	float * m = t;
+	uint64_t offset;
+
+	std::random_device random_device;
+	std::uniform_real_distribution<float> dist(0.0, 1.0);
+
+	//	Implement NCHW layout
+	for (uint32_t count = 0; count < shape.count; ++ count) {
+		for (uint32_t chIdx = 0; chIdx < shape.channels; ++ chIdx ) {
+			for (uint32_t rowIdx = 0; rowIdx < shape.height; ++ rowIdx) {
+				for (uint32_t colIdx = 0; colIdx < shape.width; ++ colIdx) {
+					offset = count * shape.height * shape.width * shape.channels + chIdx * shape.height * shape.width + rowIdx * shape.width + colIdx;
+					m[offset] = dist(random_device);
+				}
+			}
+		}
+	}
+	float * d_t;
+	cudaMalloc(&d_t, sizeof(float) * tensorSize(shape));
+	cudaMemcpy(d_t, t, sizeof(float) * tensorSize(shape), cudaMemcpyHostToDevice);
+	free(t);
+	return d_t;
+}
+	
+float * mallocTensor_batch (TensorShape shape) {
+	float * d_t;
+	cudaMalloc(&d_t, sizeof(float) * tensorSize(shape));
+	return d_t;
+}
+
+float * makeVector_malloc (uint64_t size) {
+
+	float *v = (float *) malloc (size * sizeof(float));
+
+	float * m = v;
+
+	std::random_device random_device;
+	std::uniform_real_distribution<float> dist(0.0, 1.0);
+
+	//	Implement NCHW layout
+	for (uint64_t idx = 0; idx < size; ++ idx) {
+		m[idx] = dist(random_device);
+	}
+
+	float * d_t;
+	cudaMalloc(&d_t, sizeof(float) * size);
+	cudaMemcpy(d_t, v, sizeof(float) * size, cudaMemcpyHostToDevice);
+	free(v);
+	return d_t;
+
+}
+
+	int runAlexnet (int argc, char ** argv){
+
+		uint32_t batchSize = 2;
+
+		auto tstart = std::chrono::high_resolution_clock::now();
+
+// Layer 1 start
+		TensorShape iShape = AlexL1_InShape;
+        iShape.count =batchSize;
+
+		TensorShape fShape = AlexL1_FilterShape;
+		ConvLayerArgs convArgs = AlexL1_ConvArgs;
+		TensorShape oShape = convout_shape(iShape, fShape, convArgs);
+
+		
+
+		float *fconv1 = makeTensor_batch (fShape);
+        float *input1 = makeTensor_batch (iShape);
+        float *output1 = mallocTensor_batch (oShape);
+		float *bias1 = makeVector_malloc(oShape.channels);
+     
+        //std::cout << "ishape : " << iShape << " \n";
+		//std::cout << "fshape : " << fShape << " \n";
+		//std::cout << "output of conv1 : " << oShape << " \n";
+
+		convLayer(input1, iShape, fconv1, fShape, bias1, output1, oShape, convArgs, 1);
+		PoolLayerArgs poolArgs = {PoolOp::MaxPool, 3, 3, 2, 2};
+
+
+		TensorShape oShape2 = poolout_shape(oShape, poolArgs);
+
+        //std::cout << "output of pool1 : " << oShape2 << " \n";
+		float *output2 = mallocTensor_batch (oShape2);
+
+
+		poolLayer (output1, oShape, output2, oShape2, poolArgs);
+// Layer 1 end
+
+// Layer 2 start
+        fShape = AlexL2_FilterShape;
+        convArgs = AlexL2_ConvArgs;
+        TensorShape oShape3 = convout_shape(oShape2, fShape, convArgs);
+
+
+		float *fconv2 = makeTensor_batch (fShape);
+        float *output3 = mallocTensor_batch (oShape3);
+		float *bias2 = makeVector_malloc(oShape.channels);
+
+		//std::cout << "fshape : " << fShape << " \n";
+		//std::cout << "output of conv2 : " << oShape3 << " \n";	
+		convLayer(output2, oShape2, fconv2, fShape, bias2, output3, oShape3, convArgs, 1);	
+
+		TensorShape oShape4 = poolout_shape(oShape3, poolArgs);
+
+        //std::cout << "output of pool2 : " << oShape4 << " \n";
+		float *output4 = mallocTensor_batch (oShape4);
+
+
+		poolLayer (output3, oShape3, output4, oShape4, poolArgs);
+// Layer 2 end
+
+// Layer 3 start
+        fShape = AlexL3_FilterShape;
+        convArgs = AlexL3_ConvArgs;
+        TensorShape oShape5 = convout_shape(oShape4, fShape, convArgs);
+
+
+        float *fconv3 = makeTensor_batch (fShape);
+        float *output5 = mallocTensor_batch (oShape5);
+        float *bias3 = makeVector_malloc(oShape5.channels);
+
+        //std::cout << "fshape : " << fShape << " \n";
+        //std::cout << "output of conv3 : " << oShape5 << " \n";	
+        convLayer(output4, oShape4, fconv3, fShape, bias3, output5, oShape5, convArgs, 1);	
+
+// Layer 3 end
+		
+// Layer 4 start
+
+        fShape = AlexL4_FilterShape;
+        convArgs = AlexL4_ConvArgs;
+        TensorShape oShape6 = convout_shape(oShape5, fShape, convArgs);
+
+
+        float *fconv4 = makeTensor_batch (fShape);
+        float *output6 = mallocTensor_batch (oShape6);
+        float *bias4 = makeVector_malloc(oShape6.channels);
+
+        //std::cout << "fshape : " << fShape << " \n";
+        //std::cout << "output of conv4 : " << oShape6 << " \n";	
+        convLayer(output5, oShape5, fconv4, fShape, bias4, output6, oShape6, convArgs, 1);	
+
+// Layer 4 end
+        
+// Layer 5 start
+
+        fShape = AlexL5_FilterShape;
+        convArgs = AlexL5_ConvArgs;
+        TensorShape oShape7 = convout_shape(oShape6, fShape, convArgs);
+
+
+        float *fconv5 = makeTensor_batch (fShape);
+        float *output7 = mallocTensor_batch (oShape7);
+        float *bias5 = makeVector_malloc(oShape7.channels);
+
+        //std::cout << "fshape : " << fShape << " \n";
+        //std::cout << "output of conv4 : " << oShape7 << " \n";	
+        convLayer(output6, oShape6, fconv5, fShape, bias5, output7, oShape7, convArgs, 1);	
+
+
+        TensorShape oShape8 = poolout_shape(oShape7, poolArgs);
+
+        //std::cout << "output of pool3 : " << oShape8 << " \n";
+        float *output8 = mallocTensor_batch (oShape8);
+
+
+        poolLayer (output7, oShape7, output8, oShape8, poolArgs);
+
+// Layer 5 end
+
+// Layer 6FC start
+
+        TensorShape oShapeA; 
+		oShapeA.width = oShape8.channels * oShape8.height * oShape8.width;
+		oShapeA.height = oShape8.count;
+		oShapeA.channels = 1;
+		oShapeA.count = 1;
+
+        TensorShape oShapeB = AlexL6_FCShape;
+		TensorShape oShapeC = gemmout_shape(oShapeA, oShapeB);
+		GemmLayerArgs args = Alex_FCArgs;
+
+		//std::cout << "Ashape : " << oShapeA << " \n";
+        //std::cout << "Bshape : " << oShapeB << " \n";
+		//std::cout << "Cshape : " << oShapeC << " \n";
+
+		// output8 contains matrix A
+		float *FC1 = makeTensor_batch (oShapeB);
+		float *output9 = mallocTensor_batch (oShapeC);
+
+		gemmLayer (output8, oShapeA, FC1, oShapeB, output9 , oShapeC, args, 1);
+
+// Layer 7FC start
+
+        TensorShape oShapeA2 = oShapeC; 
+        TensorShape oShapeB2 = AlexL7_FCShape;
+        TensorShape oShapeC2 = gemmout_shape(oShapeA2, oShapeB2);
+
+        //std::cout << "Ashape : " << oShapeA2 << " \n";
+        //std::cout << "Bshape : " << oShapeB2 << " \n";
+        //std::cout << "Cshape : " << oShapeC2 << " \n";
+
+        // output9 contains matrix A
+        float *FC2 = makeTensor_batch (oShapeB2);
+        float *output10 = mallocTensor_batch (oShapeC2);
+
+        gemmLayer (output9, oShapeA2, FC2, oShapeB2, output10, oShapeC2, args, 1);
+		
+		float *out_final = (float *) malloc(tensorSize(oShapeC2) * sizeof(float));
+
+		cudaMemcpy(out_final, output10, sizeof(float) * tensorSize(oShapeC2), cudaMemcpyDeviceToHost);
+
+		auto tEnd = std::chrono::high_resolution_clock::now();
+		
+		std::chrono::duration<double> time_span = (tEnd- tstart);
+		std::cout << "\nIt took " << time_span.count() << " seconds.";
+		
+		
+
+// Layer 7 end
+		return 0;
+	
+	}
+
 
