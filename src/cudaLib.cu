@@ -130,7 +130,7 @@ uint64_t evaluateGpuConv (TensorShape iShape, TensorShape fShape,
 	return errorCount;
 }
 
-
+// Function to calculate output tensor shape of CONV operation
 TensorShape convout_shape(TensorShape iShape, TensorShape fShape, ConvLayerArgs args){
 
     TensorShape oShape;
@@ -143,6 +143,7 @@ TensorShape convout_shape(TensorShape iShape, TensorShape fShape, ConvLayerArgs 
 
 }
 
+// Function to calculate output tensor shape of POOL operation
 TensorShape poolout_shape(TensorShape iShape, PoolLayerArgs poolArgs){
 
 	TensorShape outShape;
@@ -157,6 +158,7 @@ TensorShape poolout_shape(TensorShape iShape, PoolLayerArgs poolArgs){
 
 }
 
+// Function to calculate output tensor shape of GEMM operation
 TensorShape gemmout_shape(TensorShape aShape, TensorShape bShape){
 
 	TensorShape cShape;
@@ -171,7 +173,7 @@ TensorShape gemmout_shape(TensorShape aShape, TensorShape bShape){
 }
 
 
-
+// An API for conv layer
 void convLayer ( float * input, TensorShape iShape, 
 	float * filter, TensorShape fShape, 
 	float * bias, float * output, TensorShape oShape, 
@@ -235,7 +237,7 @@ void convLayer_gpu ( float * input, TensorShape iShape,
 		
 	}
 
-
+    // I pull in the values into the shared memory, one channel at a time. 
 	for (uint32_t c=0; c<iShape.channels; c++) {
 
 
@@ -312,6 +314,7 @@ int evaluateGpuGemm () {
 	return 0;
 }
 
+// An API for gemm layer
 void gemmLayer (float * a, TensorShape aShape, 
 	float * b, TensorShape bShape,
 	float * c, TensorShape cShape,
@@ -440,7 +443,7 @@ int runGpuPool (TensorShape inShape, PoolLayerArgs poolArgs){
 
 }
 
-
+// An API for pool layer
 void poolLayer (float * input, TensorShape inShape,
 	float * output, TensorShape outShape, PoolLayerArgs args){
 
@@ -526,6 +529,8 @@ void poolLayer_gpu (float * input, TensorShape inShape,
 		}
 
 		__syncthreads();   //Wait for all threads to be done.
+
+    // Tiling is done at the input level. This is likely okay for performance as pool is a reduction operation.
 
     if ( (col % args.strideW == 0) && (row % args.strideH == 0) && ((col + args.poolW) <= inShape.width) && ((row + args.poolH) <= inShape.height) )  {
         
